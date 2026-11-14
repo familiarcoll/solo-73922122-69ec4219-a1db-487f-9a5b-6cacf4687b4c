@@ -376,6 +376,29 @@ def get_generation(conn) -> int:
     return int(conn.execute("SELECT generation FROM store_meta WHERE id = 1").fetchone()[0])
 
 
+def fetch_roads_snapshot(conn, road_ids: Sequence[str]) -> tuple[int, dict[str, dict]]:
+    """在当前读快照内一次性取出指定路段的持久化线形。
+
+    返回 ``(generation, {road_id: {"geometry": dict|None, "missing": [...]}})``。
+    缺失的 ID 不会出现在字典里，由调用方判定。所有读取共用同一连接/事务，
+    因此结果必定来自同一个已提交状态。
+    """
+    generation = get_generation(conn)
+    out: dict[str, dict] = {}
+    for chunk in _chunks(sorted(set(road_ids))):
+        marks = ",".join("?" * len(chunk))
+        for row in conn.execute(
+            f"SELECT id, geometry, missing_point_ids FROM roads "
+            f"WHERE id IN ({marks})",
+            chunk,
+        ):
+            out[row["id"]] = {
+                "geometry": json.loads(row["geometry"]) if row["geometry"] else None,
+                "missing": json.loads(row["missing_point_ids"]),
+            }
+    return generation, out
+
+
 def list_points(conn) -> list[PointIn]:
     return [
         PointIn(id=r["id"], lon=r["lon"], lat=r["lat"])

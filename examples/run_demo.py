@@ -141,6 +141,43 @@ def _run(args) -> None:
         "RD-105": b.road("RD-105"),
     })
 
+    # -- 5b: 重合里程核算 ----------------------------------------------
+    # 新建两条东西向、部分共线重合的路段（RD-201 与 RD-202 共享中间一段），
+    # 再加上仅端点相触的 RD-103，验证精确共线去重、单点相交不算、WGS84 计米。
+    a.batch(
+        {
+            "points": [
+                {"id": "OV-1", "lon": 116.500, "lat": 39.950},
+                {"id": "OV-2", "lon": 116.510, "lat": 39.950},
+                {"id": "OV-3", "lon": 116.520, "lat": 39.950},
+                {"id": "OV-4", "lon": 116.530, "lat": 39.950},
+            ],
+            "roads": [
+                {"id": "RD-201", "point_ids": ["OV-1", "OV-2", "OV-3"]},
+                # 反向录入 + 不同拆分：OV-3 -> OV-2，与 RD-201 的 OV-2..OV-3 重合
+                {"id": "RD-202", "point_ids": ["OV-4", "OV-3", "OV-2"]},
+            ],
+        }
+    )
+    overlap = a.http.post(
+        "/api/v1/overlap-accounting",
+        json={"road_ids": ["RD-201", "RD-202"]},
+    )
+    overlap.raise_for_status()
+    pretty("5b. 重合里程核算：反向录入/不同拆分仍精确去重，长度按 WGS84 测地线", overlap.json())
+    ob = overlap.json()
+    r202 = next(r for r in ob["roads"] if r["road_id"] == "RD-202")
+    assert r202["covered_segments"][0]["covered_by_road_id"] == "RD-201"
+    assert r202["counted_meters"] + r202["covered_meters"] == r202["total_meters"]
+
+    # 缺点路段使整次核算失败（422），不返回部分结果
+    bad = a.http.post(
+        "/api/v1/overlap-accounting",
+        json={"road_ids": ["RD-201", "RD-NOPE"]},
+    )
+    assert bad.status_code == 422, bad.text
+    pretty("5c. 不存在的路段使整次核算失败（HTTP 422）", bad.json())
+
     # -- 6 --------------------------------------------------------------
     before = b.state()
     try:

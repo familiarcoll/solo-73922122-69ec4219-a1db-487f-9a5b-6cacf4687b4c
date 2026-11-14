@@ -5,8 +5,12 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .overlap import MAX_VERTICES as MAX_ROAD_VERTICES
+
 MAX_ABS_LON = 180.0
 MAX_ABS_LAT = 85.0511287798066
+MIN_OVERLAP_ROADS = 2
+MAX_OVERLAP_ROADS = 12
 
 
 class PointIn(BaseModel):
@@ -184,6 +188,74 @@ class HealthResponse(BaseModel):
     status: Literal["ok"]
     db: str
     journal_mode: str
+
+
+# ---------------------------------------------------------------------------
+# 重合里程核算
+# ---------------------------------------------------------------------------
+
+
+class OverlapRequest(BaseModel):
+    """重合里程核算请求：2～12 个完整路段 ID（不可重复）。"""
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"road_ids": ["RD-101", "RD-102", "RD-103"]}]
+        }
+    }
+
+    road_ids: list[str] = Field(
+        min_length=MIN_OVERLAP_ROADS,
+        max_length=MAX_OVERLAP_ROADS,
+        description="待核算的路段 ID，2～12 个且不可重复；所有路段必须已持久化完整线形",
+    )
+
+    @field_validator("road_ids")
+    @classmethod
+    def _clean_and_unique(cls, v: list[str]) -> list[str]:
+        cleaned = [rid.strip() for rid in v]
+        if any(not rid for rid in cleaned):
+            raise ValueError("road ids must not be blank")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("road ids must be unique")
+        return cleaned
+
+
+class CoveredSegment(BaseModel):
+    """一段被前序路段覆盖的重合弧，归属到最早覆盖它的路段。"""
+
+    covered_by_road_id: str = Field(description="最早覆盖该线段的前序路段 ID")
+    coordinates: list[list[float]] = Field(
+        description="当前路段上该重合弧的 GeoJSON 坐标序列（[lon, lat]，按当前路段顶点顺序）"
+    )
+    meters: float = Field(description="该重合段的 WGS84 测地线长度（米）")
+
+
+class OverlapRoadResult(BaseModel):
+    """单条路段的核算结果（按路段 ID 升序返回）。"""
+
+    road_id: str = Field(description="路段 ID")
+    total_meters: float = Field(description="路段完整长度（WGS84 测地线，米）")
+    counted_meters: float = Field(
+        description="实际计入去重总量的米数 = 全长 − 被前序路段覆盖的去重长度"
+    )
+    covered_meters: float = Field(description="被前序路段覆盖的去重总长（米）")
+    covered_segments: list[CoveredSegment] = Field(
+        description="被前序路段覆盖的线段，沿本路段顺序排列；三路以上覆盖只出现一次"
+    )
+
+
+class OverlapResponse(BaseModel):
+    """重合里程核算结果；全部数据来自同一个已提交快照。"""
+
+    generation: int = Field(description="读取快照的提交代号 store_meta.generation")
+    roads: list[OverlapRoadResult] = Field(description="每条路段的核算结果，按 ID 升序")
+    duplicate_meters: float = Field(
+        description="被判定为重复登记的总米数（所有覆盖段之和，每条重合弧只计一次）"
+    )
+    deduped_total_meters: float = Field(
+        description="去重后总米数 = 各路段 counted_meters 之和"
+    )
 
 
 BatchResult.model_rebuild()

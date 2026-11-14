@@ -6,13 +6,16 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 
-from . import store
+from . import accounting, store
 from .config import settings
 from .db import init_db, read_tx
+from .overlap import OverlapError
 from .schemas import (
     BatchIn,
     BatchResult,
     HealthResponse,
+    OverlapRequest,
+    OverlapResponse,
     PointIn,
     PointsResponse,
     RoadOut,
@@ -37,6 +40,17 @@ DESCRIPTION = """
 `BEGIN IMMEDIATE`。两个 API 进程共用同一个 SQLite 文件（WAL 模式），
 写者互斥、读者不阻塞，提交前还会复核快照代号，因此并发改线不会漏更新、
 也不会写回旧坐标。
+
+## 重合里程核算
+
+`POST /api/v1/overlap-accounting` 输入 2～12 个**完整路段 ID**，在
+**同一个已提交快照**里读取它们持久化的 GeoJSON 线形，只把经纬度平面上
+**精确共线且重合长度大于零**的部分视为重复登记：反向录入、不同顶点拆分
+均能识别，三条以上路段的共同覆盖只计一次，单点相交/端点相触不算。
+
+路段按 ID 升序归属共有线段，返回每条路实际计入的米数、被前序路段覆盖的
+线段及去重总米数；所有长度按 WGS84 测地线计算。缺点或不存在的路段会让
+整次核算失败（422），不会混用不同提交状态的数据。
 """
 
 
@@ -132,3 +146,26 @@ def get_road(road_id: str) -> RoadOut:
     if not roads:
         raise HTTPException(status_code=404, detail=f"road {road_id!r} not found")
     return roads[0]
+
+
+@app.post("/api/v1/overlap-accounting", response_model=OverlapResponse)
+def post_overlap_accounting(req: OverlapRequest) -> OverlapResponse:
+    """重合里程核算：同一读快照内的精确共线去重，长度按 WGS84 测地线计米。
+
+    任一路段不存在、缺点（incomplete）、顶点超过 40 个或跨越 180° 经线，
+    整次核算失败并在 ``detail.invalid_roads`` 里逐条列明原因（HTTP 422）。
+    """
+    try:
+        return accounting.run_accounting(req)
+    except OverlapError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "overlap accounting failed: every road must exist and "
+                "have a complete persisted LineString",
+                "invalid_roads": [
+                    {"road_id": rid, "reason": why}
+                    for rid, why in exc.invalid.items()
+                ],
+            },
+        ) from exc

@@ -25,7 +25,14 @@ def _free_port() -> int:
 def two_apis(db_path):
     procs = []
     ports = []
-    env = dict(os.environ, GIS_DB_PATH=str(db_path), GIS_BUSY_TIMEOUT_S="30")
+    env = dict(
+        os.environ,
+        GIS_DB_PATH=str(db_path),
+        GIS_BUSY_TIMEOUT_S="30",
+        # the child runs server_runner.py by path, so only tests/ lands on
+        # sys.path; put the project root on PYTHONPATH to import the app package
+        PYTHONPATH=ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""),
+    )
     stop_file = str(db_path) + ".stop"
     try:
         for _ in range(2):
@@ -248,3 +255,58 @@ def test_state_endpoint_is_consistent_under_writes(apis):
         stop.set()
         t.join(timeout=20)
     assert not failures, failures
+
+
+def test_overlap_accounting_reads_one_committed_snapshot(apis):
+    """核算响应的 generation 必须与同库 /state 一致，且并发改线后能读到新快照。"""
+    a, b = apis
+    r = httpx.post(
+        a + "/api/v1/batches",
+        json={
+            "points": [
+                {"id": "OV1", "lon": 50.0, "lat": 10.0},
+                {"id": "OV2", "lon": 50.01, "lat": 10.0},
+                {"id": "OV3", "lon": 50.02, "lat": 10.0},
+            ],
+            "roads": [
+                {"id": "ROV1", "point_ids": ["OV1", "OV2", "OV3"]},
+                {"id": "ROV2", "point_ids": ["OV2", "OV3"]},
+            ],
+        },
+        timeout=10,
+    )
+    assert r.status_code == 201, r.text
+
+    gen_before = httpx.get(b + "/api/v1/state", timeout=10).json()["generation"]
+    acc = httpx.post(
+        b + "/api/v1/overlap-accounting",
+        json={"road_ids": ["ROV1", "ROV2"]},
+        timeout=10,
+    )
+    assert acc.status_code == 200, acc.text
+    body = acc.json()
+    assert body["generation"] >= gen_before
+    rov2 = next(x for x in body["roads"] if x["road_id"] == "ROV2")
+    assert rov2["covered_segments"][0]["covered_by_road_id"] == "ROV1"
+    assert rov2["counted_meters"] == 0.0
+
+    # 并发改线（API A 更正坐标）后，核算必须来自新的提交状态
+    r = httpx.post(
+        a + "/api/v1/batches",
+        json={"points": [{"id": "OV1", "lon": 50.0005, "lat": 10.0}]},
+        timeout=10,
+    )
+    assert r.status_code == 201, r.text
+    gen_after = httpx.get(b + "/api/v1/state", timeout=10).json()["generation"]
+    assert gen_after > gen_before
+    acc2 = httpx.post(
+        b + "/api/v1/overlap-accounting",
+        json={"road_ids": ["ROV1", "ROV2"]},
+        timeout=10,
+    ).json()
+    assert acc2["generation"] == gen_after
+    # ROV1 改线后首段不再与 ROV2 共线，ROV2 的覆盖关系随之按新快照重算
+    rov2_after = next(x for x in acc2["roads"] if x["road_id"] == "ROV2")
+    # ROV2 本身未变（OV2->OV3），ROV1 的 OV2->OV3 段也未变，仍完全被覆盖
+    assert rov2_after["counted_meters"] == 0.0
+    assert rov2_after["covered_segments"][0]["covered_by_road_id"] == "ROV1"

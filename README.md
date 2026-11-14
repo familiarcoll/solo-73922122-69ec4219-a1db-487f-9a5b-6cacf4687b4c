@@ -31,6 +31,7 @@ curl -s http://localhost:8001/api/v1/state | head -c 400
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/v1/batches` | 一个批次=一个事务：批量新增/更正测点与路段、批量删除；返回受影响路段的最终状态 |
+| POST | `/api/v1/overlap-accounting` | **重合里程核算**：2～12 个完整路段 ID，精确共线去重，WGS84 测地线计米 |
 | GET | `/api/v1/state` | **一个读快照**返回全部测点原值 + 全部已持久化线形（含 `generation`） |
 | GET | `/api/v1/points` / `/api/v1/points/{id}` | 查询测点 |
 | GET | `/api/v1/roads` / `/api/v1/roads/{id}` | 查询路段（只读已持久化的 `geometry`，不现场组线） |
@@ -78,6 +79,71 @@ curl -s http://localhost:8001/api/v1/state | head -c 400
 4. **整批原子**：批次中途任何异常（含写完后注入）整体回滚，`generation` 不前进，库保持原状。
 5. **重启保留**：SQLite 文件在命名卷里，`docker compose restart` / 重建容器后数据仍在。
 
+## 重合里程核算（`POST /api/v1/overlap-accounting`）
+
+养护 GIS 数据员汇总多批道路里程时，同一段路可能被重复登记。本接口在
+**同一个已提交快照**内读取 2～12 个路段持久化的 GeoJSON 线形，核算共有线段：
+
+```json
+{ "road_ids": ["RD-101", "RD-102", "RD-103"] }
+```
+
+判定与归属规则：
+
+* **平面精确共线 + 正长度**：只在经纬度平面上方向向量归一化叉积为零、且落在
+  同一条直线上的两小段才视为共线（相对容限 `1e-12`，只吸收浮点误差）；
+  重合区间长度严格大于零才算重复——**单点相交、端点相触不算**，平行不共线不算。
+* **反向录入**：方向相反的两条路照常识别（投影求交与方向无关）。
+* **不同顶点拆分**：按“小线段 × 小线段”逐对求交，内部顶点只是切分点，
+  稀疏顶点与密集顶点的两条路也能正确求交。
+* **三条以上覆盖只计一次**：路段按 **ID 升序**处理，每条路只与前序路比较，
+  每段重合归属到**最早覆盖它的前序路段**（`covered_segments[].covered_by_road_id`）。
+* **长度按 WGS84 测地线**（`geographiclib`，椭球 `a=6378137, f=1/298.257223563`）
+  计算米数；重合弧按弧长比例切分整段测地线长，任意顶点拆分下
+  `counted_meters + covered_meters == total_meters` 严格闭合（6 位小数）。
+
+响应：
+
+```json
+{
+  "generation": 7,
+  "roads": [
+    {
+      "road_id": "RD-101",
+      "total_meters": 1710.365866,
+      "counted_meters": 855.182932,
+      "covered_meters": 855.182934,
+      "covered_segments": [
+        {
+          "covered_by_road_id": "RD-100",
+          "coordinates": [[116.31, 39.9], [116.32, 39.9]],
+          "meters": 855.182934
+        }
+      ]
+    }
+  ],
+  "duplicate_meters": 855.182934,
+  "deduped_total_meters": 3420.731733
+}
+```
+
+* `total_meters` 路段全长；`counted_meters` 实际计入去重总量的米数；
+  `covered_meters` 被前序路段覆盖的去重总长；`covered_segments` 为归属明细。
+* `duplicate_meters` 为全部重复米数（每条重合弧只计一次）；
+  `deduped_total_meters` 为去重后总米数（各路段 `counted_meters` 之和）。
+* `generation` 标明本次读取的提交代号，与同时刻 `GET /api/v1/state` 一致。
+
+失败语义（HTTP 422，`detail.invalid_roads` 逐条列明，整次核算不出部分结果）：
+
+* 路段 ID 不存在；
+* 路段缺点（`incomplete`，无持久化线形）；
+* 线形顶点数超过 **40**；
+* 路段相邻顶点经度差 > 180°，即**跨越 180° 经线**。
+
+所有路段在一个延迟读事务（同一 WAL 快照）内一次性读出，因此并发改线时
+绝不会混用不同提交状态的数据；请求体层面还会拒绝 ID 数量越界（<2 或 >12）
+与重复 ID。
+
 ## 并发模型（两个进程共库）
 
 * 每个请求一条短连接；写事务一律 `BEGIN IMMEDIATE` + `busy_timeout=30s`，两个进程的写入互斥但排队等待，不报 busy。
@@ -104,8 +170,10 @@ pytest            # 功能 + 双进程并发（测试会真的起两个 API 进�
 `tests/server_runner.py` 起两个独立进程，连接同一个 SQLite 文件。）
 
 `tests/test_concurrency.py` 起两个真实 API 进程共库运行：跨进程一致性、暂停组线不持写锁、
-并发改线无漏更新/旧坐标、`/state` 在持续写入下的快照一致性；
-`tests/test_retry.py` 用可控方式制造"规划后另一进程提交"，断言旧规划被丢弃并重算。
+并发改线无漏更新/旧坐标、`/state` 在持续写入下的快照一致性、核算接口的快照归属；
+`tests/test_retry.py` 用可控方式制造"规划后另一进程提交"，断言旧规划被丢弃并重算；
+`tests/test_overlap.py` 覆盖重合核算：共线/反向/不同拆分/三路覆盖只计一次/
+单点相交不算/平行不算、缺点与不存在整次失败、40 顶点与 180° 经线限制、测地线长度闭合。
 
 ## 演示样例（要点）
 
